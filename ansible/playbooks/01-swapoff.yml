@@ -1,0 +1,90 @@
+---
+# Playbook - Kubernetes Prerequisites on All Nodes: swapoff
+- name: Kubernetes Prerequisites on All Nodes - swapoff
+
+  # Inventory group this playbook will run against
+  hosts: k8s_cluster
+
+  # Run all tasks with elevated (root) privileges
+  become: yes
+
+  # Collect system facts (OS, IPs, memory, etc.)
+  gather_facts: yes
+
+  # List of tasks to execute on each host
+  tasks:
+
+    # Human-readable task name shown in Ansible output
+    - name: Display node information
+
+      # Debug module prints messages to the console
+      debug:
+        # inventory_hostname = Ansible host name
+        # ansible_host       = IP or DNS name of the host
+        msg: "Connected to {{ inventory_hostname }} ({{ ansible_host }})"
+
+    # Check whether swap is currently enabled on the node
+    - name: Check swap on master and worker nodes
+
+      # swapon --show lists all active swap devices/files
+      # If swap is disabled, this command produces no output
+      command: swapon --show
+
+      # Save the command output into a variable called swap_status
+      register: swap_status
+
+      # Mark this task as "not changing the system"
+      # Prevents Ansible from reporting this as CHANGED
+      changed_when: false
+
+    # Display the current swap status for visibility/debugging
+    - name: Show swap status
+
+      # Print the contents of swap_status.stdout
+      # Empty output means swap is OFF
+      debug:
+        var: swap_status.stdout
+
+    # Disable swap immediately (runtime only, until reboot)
+    - name: Disable swap on master and worker nodes (temporarily)
+
+      # swapoff -a disables all active swap devices/files
+      command: swapoff -a
+
+      # Only run this task if swap is currently enabled
+      # stdout length > 0 means swapon --show returned entries
+      when: swap_status.stdout | length > 0
+
+    # Disable swap permanently so it does not re-enable on reboot
+    - name: Disable swap on master and worker nodes in fstab (permanently)
+
+      # lineinfile edits lines in a file safely and idempotently
+      lineinfile:
+
+        # File that defines filesystems mounted at boot
+        path: /etc/fstab
+
+        # Regular expression matching any active (non-commented) swap line
+        # ^\s*        -> optional leading whitespace
+        # ([^#].*)    -> line does not start with '#'
+        # \s+swap\s+  -> swap appears as a filesystem type
+        regexp: '^\s*([^#].*\s+swap\s+)'
+
+        # Replace the matched line by prefixing it with '#'
+        # \1 refers to the captured group in regexp
+        line: '#\1'
+
+        # Enable backreferences so \1 works correctly
+        backref: yes
+
+      # Only modify fstab if swap is currently enabled
+      when: swap_status.stdout | length > 0
+
+    - name: Verify swap is disabled
+      ansible.builtin.command: swapon --show
+      register: swap_verify
+      changed_when: false
+      failed_when: swap_verify.stdout | length > 0
+      tags: verify
+
+...

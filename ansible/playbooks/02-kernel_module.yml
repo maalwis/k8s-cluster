@@ -1,0 +1,80 @@
+---
+# Playbook - Kubernetes prerequisites on all nodes - overlay & br_netfilter kernel modules
+- name: Kubernetes prerequisites on all nodes - overlay & br_netfilter kernel modules
+  hosts: k8s_cluster
+
+  # Run tasks with elevated privileges (root).
+  become: yes
+
+  # Collect system facts (OS, network interfaces, etc.).
+  gather_facts: yes
+
+  tasks:
+    # Show which host we're connected to (useful when running on multiple nodes)
+    - name: Display node information
+      ansible.builtin.debug:
+        msg: "Connected to {{ inventory_hostname }} ({{ ansible_host | default(inventory_hostname) }})"
+
+    # Check if the overlay module is currently loaded.
+    # Using /proc/modules avoids pipes and works with ansible.builtin.command.
+    - name: Check if overlay kernel module is loaded
+      ansible.builtin.command: grep -w '^overlay' /proc/modules
+      register: overlay_status
+      changed_when: false     # This task does not change the system
+      failed_when: false      # If overlay isn't loaded, grep returns exit code 1; that shouldn't fail the play
+
+    # Print the current status. If overlay isn't loaded, stdout will be empty.
+    - name: Show overlay module status
+      ansible.builtin.debug:
+        msg: >-
+          Overlay module loaded: {{
+            'yes' if overlay_status.rc == 0 else 'no'
+          }}
+
+    # Check if the br_netfilter is currently loaded
+    # Using /proc/modules avoids pipes and works with ansible.builtin.command.
+    - name: Check if the br_netfilter is currently loaded
+      ansible.builtin.command: grep -w '^br_netfilter' /proc/modules
+      register: br_netfilter_status
+      changed_when: false
+      failed_when: false
+
+    # Print the current status. If br_netfilter isn't loaded, stdout will be empty.
+    - name: Show br_netfilter module status
+      ansible.builtin.debug:
+        msg: >-
+          br_netfilter module loaded: {{
+            'yes' if br_netfilter_status.rc == 0 else 'no'
+          }}     
+
+    # Load the overlay module now (temporary - lasts until reboot).
+    # Only runs if overlay is NOT already loaded.
+    - name: Load overlay kernel module (temporary)
+      ansible.builtin.command: modprobe overlay
+      when: overlay_status.rc != 0
+
+    # Load the br_netfilter module now (temporary - lasts until reboot).
+    # Only runs if br_netfilter is NOT already loaded.
+    - name: Load br_netfilter kernel module (temporary)
+      ansible.builtin.command: modprobe br_netfilter
+      when: br_netfilter_status.rc != 0
+
+    # Ensure overlay and br_netfilter load automatically on reboot (permanent).
+    # Using copy is idempotent and avoids heredoc + shell problems.
+    - name: Persist kernel modules across reboots
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/k8s.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          overlay
+          br_netfilter
+
+    - name: Verify overlay & br_netfilter module is loaded
+      ansible.builtin.command: lsmod
+      register: lsmod_output
+      changed_when: false
+      failed_when: >
+          'overlay' not in lsmod_output.stdout or
+          'br_netfilter' not in lsmod_output.stdout

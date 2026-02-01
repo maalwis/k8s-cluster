@@ -1,0 +1,134 @@
+---
+# Playbook - Kubernetes prerequisites on all nodes - sysctl config
+- name: Kubernetes prerequisites on all nodes - sysctl config
+  hosts: k8s_cluster
+
+  # Run tasks with elevated privileges (root).
+  become: yes
+
+  # Collect system facts (OS, network interfaces, etc.).
+  gather_facts: yes
+
+  tasks:
+    # Show which host we're connected to (useful when running on multiple nodes)
+    - name: Display node information
+      ansible.builtin.debug:
+        msg: "Connected to {{ inventory_hostname }} ({{ ansible_host | default(inventory_hostname) }})"
+
+    # Check if bridge-nf-call-iptables is currently enabled.
+    # sysctl -n prints only the value (1 or 0), making it easy to check later.
+    - name: Check bridge-nf-call-iptables value
+      ansible.builtin.command: sysctl -n net.bridge.bridge-nf-call-iptables
+      register: bridge_nf_call_iptables_status
+      changed_when: false     # This task does not change the system
+      failed_when: false      # If br_netfilter isn't loaded yet, the key won't exist; that shouldn't fail the play
+
+    # Check if bridge-nf-call-ip6tables is currently enabled.
+    # sysctl -n prints only the value (1 or 0), making it easy to check later.
+    - name: Check bridge-nf-call-ip6tables value
+      ansible.builtin.command: sysctl -n net.bridge.bridge-nf-call-ip6tables
+      register: bridge_nf_call_ip6tables_status
+      changed_when: false
+      failed_when: false
+
+    # Check if ip_forward is currently enabled.
+    # sysctl -n prints only the value (1 or 0), making it easy to check later.
+    - name: Check ip_forward value
+      ansible.builtin.command: sysctl -n net.ipv4.ip_forward
+      register: ip_forward_status
+      changed_when: false
+      failed_when: false
+
+    # Print the current status of bridge-nf-call-iptables.
+    # Checks stdout for '1' (enabled) rather than rc, since rc == 0 only means the command ran successfully.
+    - name: Show bridge_nf_call_iptables_status
+      ansible.builtin.debug:
+        msg: >-
+          bridge_nf_call_iptables : {{
+            'enabled' if bridge_nf_call_iptables_status.stdout.strip() == '1' else 'disabled'
+          }}
+
+    # Print the current status of bridge-nf-call-ip6tables.
+    # Checks stdout for '1' (enabled) rather than rc, since rc == 0 only means the command ran successfully.
+    - name: Show bridge_nf_call_ip6tables_status
+      ansible.builtin.debug:
+        msg: >-
+          bridge_nf_call_ip6tables : {{
+            'enabled' if bridge_nf_call_ip6tables_status.stdout.strip() == '1' else 'disabled'
+          }}
+
+    # Print the current status of ip_forward.
+    # Checks stdout for '1' (enabled) rather than rc, since rc == 0 only means the command ran successfully.
+    - name: Show ip_forward_status
+      ansible.builtin.debug:
+        msg: >-
+          ip_forward : {{
+            'enabled' if ip_forward_status.stdout.strip() == '1' else 'disabled'
+          }}
+
+    # Enable bridge-nf-call-iptables now (temporary - lasts until reboot).
+    # Forces bridged IPv4 traffic through iptables; required for kube-proxy and NetworkPolicies.
+    # Only runs if the value is not already set to 1.
+    - name: Enable net.bridge.bridge-nf-call-iptables
+      ansible.builtin.command: sysctl -w net.bridge.bridge-nf-call-iptables=1
+      when: bridge_nf_call_iptables_status.stdout.strip() != '1'
+
+    # Enable bridge-nf-call-ip6tables now (temporary - lasts until reboot).
+    # IPv6 equivalent of the previous setting; keeps networking consistent for dual-stack clusters.
+    # Only runs if the value is not already set to 1.
+    - name: Enable net.bridge.bridge-nf-call-ip6tables
+      ansible.builtin.command: sysctl -w net.bridge.bridge-nf-call-ip6tables=1
+      when: bridge_nf_call_ip6tables_status.stdout.strip() != '1'
+
+    # Enable ip_forward now (temporary - lasts until reboot).
+    # Allows packets to be forwarded between network interfaces; required for pod-to-pod communication across nodes.
+    # Only runs if the value is not already set to 1.
+    - name: Enable net.ipv4.ip_forward
+      ansible.builtin.command: sysctl -w net.ipv4.ip_forward=1
+      when: ip_forward_status.stdout.strip() != '1'
+
+    # Ensure all three sysctl settings persist across reboots (permanent).
+    # Using copy is idempotent and avoids heredoc + shell problems.
+    # Registers the result so we can conditionally reload sysctl only if the file changed.
+    - name: Persist sysctl settings across reboots
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/k8s.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          net.bridge.bridge-nf-call-iptables = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward = 1
+      register: sysctl_file
+
+    # Reload all sysctl config files so the persisted settings take effect immediately.
+    # Only runs if the file was actually modified by the previous task.
+    - name: Reload sysctl settings
+      ansible.builtin.command: sysctl --system
+      when: sysctl_file.changed
+
+    # Re-check all three values after enabling and persisting.
+    # Uses fresh registered variables so the final debug output reflects the actual current state.
+    - name: Verify bridge-nf-call-iptables value
+      ansible.builtin.command: sysctl -n net.bridge.bridge-nf-call-iptables
+      register: bridge_nf_call_iptables_verify
+      changed_when: false
+
+    - name: Verify bridge-nf-call-ip6tables value
+      ansible.builtin.command: sysctl -n net.bridge.bridge-nf-call-ip6tables
+      register: bridge_nf_call_ip6tables_verify
+      changed_when: false
+
+    - name: Verify ip_forward value
+      ansible.builtin.command: sysctl -n net.ipv4.ip_forward
+      register: ip_forward_verify
+      changed_when: false
+
+    # Print the final verified values. All three should show '1'.
+    - name: Show verified sysctl values
+      ansible.builtin.debug:
+        msg: >-
+          bridge_nf_call_iptables: {{ bridge_nf_call_iptables_verify.stdout.strip() }},
+          bridge_nf_call_ip6tables: {{ bridge_nf_call_ip6tables_verify.stdout.strip() }},
+          ip_forward: {{ ip_forward_verify.stdout.strip() }}
