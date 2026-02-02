@@ -169,19 +169,6 @@ ansible-playbook playbooks/prereqs.yml
 ansible-playbook playbooks/prereqs.yml -v
 ```
 
-### 5. Run on Specific Hosts/Groups
-
-```bash
-# Run only on control plane
-ansible-playbook playbooks/prereqs.yml --limit control_plane
-
-# Run only on workers
-ansible-playbook playbooks/prereqs.yml --limit workers
-
-# Run on specific host
-ansible-playbook playbooks/prereqs.yml --limit k8s-master
-```
-
 ---
 
 ## Common Ansible Commands
