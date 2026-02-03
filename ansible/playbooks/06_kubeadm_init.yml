@@ -1,0 +1,68 @@
+---
+# Pin kubelet node IP via systemd drop-in (all nodes)
+# Forces kubelet to advertise the host-only network IP (enp0s8)
+# instead of auto-detecting the default route interface.
+#
+# This ensures all Kubernetes node communication happens over
+# the private host-only network, not the NAT interface.
+- name: Pin kubelet node IP via systemd drop-in (all nodes)
+  hosts: k8s-master:k8s-node-01:k8s-node-02
+  become: yes
+  gather_facts: yes
+
+  tasks:
+    # Extract IPv4 address from the host-only network interface (enp0s8).
+    # This IP will be used as the kubelet's --node-ip.
+    - name: Set node_ip from enp0s8 (host-only network)
+      ansible.builtin.set_fact:
+        node_ip: "{{ ansible_facts['enp0s8']['ipv4']['address'] }}"
+      when: ansible_facts['enp0s8'] is defined and ansible_facts['enp0s8']['ipv4'] is defined
+
+
+    # Fail fast if the expected interface doesn't exist.
+    # Prevents silent misconfigurations.
+    - name: Fail if enp0s8 IPv4 is not detected
+      ansible.builtin.fail:
+        msg: "enp0s8 IPv4 address not found on {{ inventory_hostname }}. Ensure host-only NIC exists."
+      when: node_ip is not defined
+
+
+    # Create systemd drop-in directory for kubelet service overrides.
+    # Drop-ins in this directory extend the base kubelet.service unit.
+    - name: Ensure kubelet systemd drop-in directory exists
+      ansible.builtin.file:
+        path: /etc/systemd/system/kubelet.service.d
+        state: directory
+        mode: "0755"
+
+
+    # Write the --node-ip override to a drop-in file.
+    # This is the single source of truth for the node IP configuration.
+    - name: Write kubelet node-ip drop-in (single source of truth)
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/kubelet.service.d/20-node-ip.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Service]
+          Environment="KUBELET_EXTRA_ARGS=--node-ip={{ node_ip }}"
+
+
+    # Remove any nodeIP setting from kubelet's config.yaml.
+    # Avoid split configuration between config file and CLI args.
+    - name: Remove nodeIP from kubelet config.yaml if present (avoid split config)
+      ansible.builtin.lineinfile:
+        path: /var/lib/kubelet/config.yaml
+        regexp: '^\s*nodeIP:\s*.*$'
+        state: absent
+      failed_when: false
+
+
+    # Apply changes by reloading systemd and restarting kubelet.
+    - name: Reload systemd and restart kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        state: restarted
+        daemon_reload: yes
+
