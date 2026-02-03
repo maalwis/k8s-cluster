@@ -1,0 +1,180 @@
+---
+# Install Cilium CNI on the Kubernetes cluster.
+# Cilium provides networking, security, and observability for Kubernetes.
+# Must run after kubeadm init completes on the control plane.
+
+- name: Install Cilium CNI
+  hosts: k8s-master
+  become: yes
+  gather_facts: yes
+
+  environment:
+    # Ensure kubectl/cilium talk to the correct cluster
+    KUBECONFIG: "/etc/kubernetes/admin.conf"
+
+  tasks:
+    # Verify kubeadm init has completed successfully.
+    # The admin.conf file is only created after successful initialization.
+    - name: Ensure kubeconfig exists (kubeadm init must be completed)
+      ansible.builtin.stat:
+        path: "/etc/kubernetes/admin.conf"
+      register: kubeconfig_stat
+
+    # Fail fast if the cluster isn't initialized yet.
+    - name: Fail if kubeconfig is missing
+      ansible.builtin.fail:
+        msg: "Missing /etc/kubernetes/admin.conf. Run kubeadm init on the control-plane first."
+      when: not kubeconfig_stat.stat.exists
+
+    # Verify kubectl can communicate with the API server.
+    - name: Verify kubectl can reach the cluster
+      ansible.builtin.command: kubectl get nodes
+      register: kubectl_nodes
+      changed_when: false
+
+    # Download the official Helm installation script.
+    # Helm is needed to manage Cilium's deployment.
+    - name: Download Helm install script
+      ansible.builtin.get_url:
+        url: https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+        dest: /tmp/get-helm-3.sh
+        mode: "0755"
+
+    # Install Helm using the official script.
+    # Creates parameter makes this idempotent.
+    - name: Install Helm
+      ansible.builtin.command: /tmp/get-helm-3.sh
+      args:
+        creates: /usr/local/bin/helm
+
+    # Verify Helm is installed and working.
+    - name: Verify Helm installation
+      ansible.builtin.command: helm version
+      register: helm_version
+      changed_when: false
+
+
+    # Install Cilium CLI
+    - name: Download Cilium CLI tarball
+      ansible.builtin.get_url:
+        url: "https://github.com/cilium/cilium-cli/releases/download/v0.16.22/cilium-linux-amd64.tar.gz"
+        dest: "/tmp/cilium-linux-amd64.tar.gz"
+        mode: "0644"
+        force: no
+
+    # Extract and install the Cilium CLI binary.
+    # Creates parameter makes this idempotent.
+    - name: Install Cilium CLI into /usr/local/bin (idempotent)
+      ansible.builtin.shell: |
+        set -e
+        tar -xzf /tmp/cilium-linux-amd64.tar.gz -C /usr/local/bin cilium
+        chmod 0755 /usr/local/bin/cilium
+      args:
+        creates: /usr/local/bin/cilium
+
+    # Verify the Cilium CLI is installed and working.
+    - name: Verify Cilium CLI installed
+      ansible.builtin.command: cilium version
+      register: cilium_cli_ver
+      changed_when: false
+
+
+    # Check for conflicting CNI installations.
+    # Only one CNI can be active at a time.
+    - name: Check for existing CNI config files (.conf/.conflist)
+      ansible.builtin.shell: |
+        ls -1 /etc/cni/net.d/*.conf /etc/cni/net.d/*.conflist 2>/dev/null | wc -l
+      register: cni_files
+      changed_when: false
+
+    # Fail if another CNI is already installed.
+    # Prevents conflicts between CNI plugins.
+    - name: Fail if another CNI seems installed
+      ansible.builtin.fail:
+        msg: "Existing CNI config detected in /etc/cni/net.d. Remove old CNI before installing Cilium."
+      when: cni_files.stdout | int > 0
+
+
+    # Remove any existing Cilium installation.
+    # Ensures a clean slate before installing.
+    - name: Uninstall Cilium if present (ignore errors)
+      ansible.builtin.command: cilium uninstall
+      register: cilium_uninstall
+      failed_when: false
+      changed_when: cilium_uninstall.rc == 0
+
+    # Fallback cleanup using Helm.
+    # Catches cases where cilium CLI cleanup didn't work.
+    - name: Fallback - uninstall Helm release if still present (ignore errors)
+      ansible.builtin.command: helm -n kube-system uninstall cilium
+      register: helm_uninstall
+      failed_when: false
+      changed_when: helm_uninstall.rc == 0
+
+    # Allow time for Kubernetes to finish cleanup.
+    - name: Wait briefly for cleanup to settle
+      ansible.builtin.pause:
+        seconds: 10
+
+
+    # Install Cilium with cluster-pool IPAM mode.
+    # Uses the pod CIDR defined during kubeadm init (10.244.0.0/16).
+    - name: Install Cilium CNI into the cluster (fresh install)
+      ansible.builtin.command: >
+        cilium install
+        --version 1.16.4
+        --set ipam.mode=cluster-pool
+        --set ipam.operator.clusterPoolIPv4PodCIDRList=10.244.0.0/16
+        --set ipam.operator.clusterPoolIPv4MaskSize=24
+      register: cilium_install
+      changed_when: true
+
+
+    # Wait for Cilium components to become healthy.
+    # Retries for up to 5 minutes (30 retries × 10 seconds).
+    - name: Wait for Cilium components to become ready
+      ansible.builtin.command: cilium status --wait
+      register: cilium_status
+      changed_when: false
+      retries: 30
+      delay: 10
+      until: cilium_status.rc == 0
+
+
+    # Wait for CoreDNS to become ready.
+    # CoreDNS requires the CNI to be functional.
+    - name: Wait for CoreDNS to become Available
+      ansible.builtin.command: kubectl -n kube-system rollout status deployment/coredns --timeout=300s
+      changed_when: false
+
+
+    # Get the current Cilium status summary.
+    - name: Show Cilium status summary
+      ansible.builtin.command: cilium status
+      register: cilium_status_summary
+      changed_when: false
+
+
+    # Display Cilium status details.
+    - name: Print Cilium status
+      ansible.builtin.debug:
+        var: cilium_status_summary.stdout_lines
+
+
+    # Wait for all nodes to reach Ready state.
+    # Nodes can't be Ready until the CNI is functional.
+    - name: Wait for all nodes to become Ready
+      ansible.builtin.command: kubectl wait --for=condition=Ready node --all --timeout=300s
+      changed_when: false
+
+
+    # Get final node status for verification.
+    - name: Show final node status
+      ansible.builtin.command: kubectl get nodes -o wide
+      register: final_nodes
+      changed_when: false
+
+    # Display final node status.
+    - name: Print final node status
+      ansible.builtin.debug:
+        var: final_nodes.stdout_lines
