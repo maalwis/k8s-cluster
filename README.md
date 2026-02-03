@@ -13,10 +13,10 @@ This project provides a complete automation solution for setting up a multi-node
 
 ## Prerequisites
 
-- [Vagrant](https://www.vagrantup.com/) (2.3.0+)
-- [VirtualBox](https://www.virtualbox.org/) (6.1+)
-- [Ansible](https://www.ansible.com/) (2.15+)
-- Host machine with at least 8GB RAM
+- [Vagrant](https://www.vagrantup.com/)
+- [VirtualBox](https://www.virtualbox.org/)
+- [Ansible](https://www.ansible.com/)
+- Host machine with at least 16GB RAM
 
 ## 🧱 Architecture
 
@@ -67,8 +67,8 @@ This project provides a complete automation solution for setting up a multi-node
 ### 1. Clone the Repository
 
 ```bash
-git clone <repository-url>
-cd <repository-name>
+git clone https://github.com/maalwis/k8s-cluster.git
+cd k8s-cluster
 ```
 
 ### 2. Start Vagrant VMs
@@ -80,7 +80,7 @@ cd vagrant && vagrant up
 ```
 
 This creates three VMs:
-- `k8s-master` (192.168.56.10) - 2 vCPUs, 2GB RAM
+- `k8s-master` (192.168.56.10) - 2 vCPUs, 8GB RAM
 - `k8s-node-01` (192.168.56.11) - 2 vCPUs, 2GB RAM
 - `k8s-node-02` (192.168.56.12) - 2 vCPUs, 2GB RAM
 
