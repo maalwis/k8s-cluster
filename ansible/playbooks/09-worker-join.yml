@@ -1,0 +1,134 @@
+---
+# Join WORKER nodes to the Kubernetes cluster.
+# Retrieves a fresh join token from the master and joins worker nodes.
+# Idempotent - skips join if node is already part of the cluster.
+
+- name: Join worker nodes to the cluster
+  hosts: workers
+  become: yes
+  gather_facts: yes
+
+  vars:
+    control_plane_endpoint: "192.168.56.10:6443"
+    cri_socket: "unix:///run/containerd/containerd.sock"
+
+  tasks:
+    # Extract the host-only network IP to use as the node IP.
+    - name: Set worker_node_ip from enp0s8
+      ansible.builtin.set_fact:
+        worker_node_ip: "{{ ansible_facts['enp0s8']['ipv4']['address'] }}"
+      when: ansible_facts['enp0s8'] is defined and ansible_facts['enp0s8']['ipv4'] is defined
+
+
+    # Fail if the host-only interface doesn't exist.
+    - name: Fail if enp0s8 IPv4 not detected
+      ansible.builtin.fail:
+        msg: "enp0s8 IPv4 address not found on {{ inventory_hostname }}"
+      when: worker_node_ip is not defined
+
+
+    # Check if this node has already joined the cluster.
+    # kubelet.conf is created during the join process.
+    - name: Check if this node is already joined (kubelet.conf exists)
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf
+
+
+    # Generate a fresh join token and command from the master.
+    # Delegated to master, run once for all workers.
+    - name: Get kubeadm join command from control-plane
+      ansible.builtin.command: kubeadm token create --print-join-command
+      delegate_to: k8s-master
+      run_once: true
+      register: join_cmd
+      changed_when: false
+
+
+    # Extract the bootstrap token from the join command.
+    - name: Extract token from join command
+      ansible.builtin.set_fact:
+        kubeadm_token: "{{ join_cmd.stdout | regex_search('--token\\s+(\\S+)') | regex_replace('--token\\s+', '') }}"
+      run_once: true
+
+
+    # Extract the CA certificate hash from the join command.
+    - name: Extract caCertHash from join command
+      ansible.builtin.set_fact:
+        kubeadm_hash: "{{ join_cmd.stdout | regex_search('--discovery-token-ca-cert-hash\\s+(\\S+)') | regex_replace('--discovery-token-ca-cert-hash\\s+', '') }}"
+      run_once: true
+
+
+    # Fail if token or hash extraction failed.
+    - name: Fail if token/hash could not be extracted
+      ansible.builtin.fail:
+        msg: "Could not extract kubeadm token/hash from join command: {{ join_cmd.stdout }}"
+      when: kubeadm_token is not defined or kubeadm_hash is not defined or kubeadm_token == '' or kubeadm_hash == ''
+      run_once: true
+
+
+    # Create a JoinConfiguration file for kubeadm.
+    # Specifies:
+    # - Control plane endpoint
+    # - Bootstrap token and CA hash for secure cluster discovery
+    # - CRI socket (containerd)
+    # - Node IP from host-only network
+    - name: Create kubeadm JoinConfiguration file
+      ansible.builtin.copy:
+        dest: /root/kubeadm-join.yaml
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          apiVersion: kubeadm.k8s.io/v1beta4
+          kind: JoinConfiguration
+          discovery:
+            bootstrapToken:
+              apiServerEndpoint: "{{ control_plane_endpoint }}"
+              token: {{ kubeadm_token }}
+              caCertHashes:
+                - {{ kubeadm_hash }}
+          nodeRegistration:
+            criSocket: "{{ cri_socket }}"
+            kubeletExtraArgs:
+              - name: node-ip
+                value: "{{ worker_node_ip }}"
+
+
+    # Join the worker node to the cluster.
+    # Only runs if kubelet.conf doesn't exist (node not already joined).
+    - name: Join worker using kubeadm config
+      ansible.builtin.command: kubeadm join --config /root/kubeadm-join.yaml
+      when: kubelet_conf.stat.exists == false
+      register: join_result
+      changed_when: true
+
+
+    # Ensure kubelet is enabled and running.
+    - name: Ensure kubelet is enabled and restarted
+      ansible.builtin.systemd:
+        name: kubelet
+        state: restarted
+        enabled: yes
+
+
+    # Allow time for the node to register with the API server.
+    - name: Wait briefly for node registration
+      ansible.builtin.pause:
+        seconds: 30
+
+
+    # Verify all nodes from the control plane.
+    - name: Verify nodes from control-plane
+      ansible.builtin.command: kubectl get nodes -o wide --kubeconfig=/etc/kubernetes/admin.conf
+      delegate_to: k8s-master
+      run_once: true
+      register: nodes_out
+      changed_when: false
+
+
+    # Display the cluster node status.
+    - name: Print cluster nodes
+      ansible.builtin.debug:
+        var: nodes_out.stdout_lines
+      run_once: true
