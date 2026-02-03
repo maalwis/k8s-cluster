@@ -1,0 +1,157 @@
+---
+# Initialize Kubernetes control plane (MASTER ONLY, idempotent)
+# Runs kubeadm init on the master node to bootstrap the cluster.
+# Safe to run multiple times - skips initialization if already done.
+- name: Initialize Kubernetes control plane (MASTER ONLY, idempotent)
+  hosts: k8s-master
+  become: yes
+  gather_facts: yes
+
+  tasks:
+    # Extract the host-only network IP to use as the API server address.
+    # This ensures the API server is accessible over the private network.
+    - name: Set api_server_ip from enp0s8 (host-only network)
+      ansible.builtin.set_fact:
+        api_server_ip: "{{ ansible_facts['enp0s8']['ipv4']['address'] }}"
+      when: ansible_facts['enp0s8'] is defined and ansible_facts['enp0s8']['ipv4'] is defined
+
+
+    # Fail fast if the host-only interface doesn't exist.
+    - name: Fail if enp0s8 IPv4 is not detected
+      ansible.builtin.fail:
+        msg: "enp0s8 IPv4 address not found. Ensure host-only NIC exists."
+      when: api_server_ip is not defined
+
+
+    # Show which IP will be used for the API server.
+    - name: Display API server IP that will be used
+      ansible.builtin.debug:
+        msg: "API server will advertise on: {{ api_server_ip }}"
+
+
+    # Check if the cluster is already initialized.
+    # If admin.conf exists, kubeadm init has already run successfully.
+    - name: Check if cluster is already initialized (admin.conf exists)
+      ansible.builtin.stat:
+        path: "/etc/kubernetes/admin.conf"
+      register: adminconf
+
+
+    # Create kubeadm configuration file.
+    # Defines:
+    # - API server address and port
+    # - Pod and service network CIDRs
+    # - containerd as the CRI socket
+    # - Certificate SANs for TLS validation
+    - name: Create kubeadm init configuration file (v1beta4) matching your manual manifests
+      ansible.builtin.copy:
+        dest: /root/kubeadm-config.yaml
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          apiVersion: kubeadm.k8s.io/v1beta4
+          kind: InitConfiguration
+          localAPIEndpoint:
+            advertiseAddress: "{{ api_server_ip }}"
+            bindPort: 6443
+          nodeRegistration:
+            criSocket: unix:///run/containerd/containerd.sock
+            kubeletExtraArgs:
+              - name: node-ip
+                value: "{{ api_server_ip }}"
+          ---
+          apiVersion: kubeadm.k8s.io/v1beta4
+          kind: ClusterConfiguration
+          kubernetesVersion: v1.35.0
+          controlPlaneEndpoint: "{{ api_server_ip }}:6443"
+          networking:
+            podSubnet: 10.244.0.0/16
+            serviceSubnet: 10.96.0.0/12
+          apiServer:
+            certSANs:
+              - "{{ api_server_ip }}"
+              - "k8s-master"
+              - "localhost"
+              - "127.0.0.1"
+            extraArgs:
+              - name: advertise-address
+                value: "{{ api_server_ip }}"
+          ---
+          apiVersion: kubelet.config.k8s.io/v1beta1
+          kind: KubeletConfiguration
+          cgroupDriver: systemd
+          clusterDNS:
+            - 10.96.0.10
+          clusterDomain: cluster.local
+
+
+    # Run kubeadm init to bootstrap the control plane.
+    # Only runs if admin.conf doesn't exist (idempotent).
+    - name: Initialize Kubernetes control plane with config file (only if not already initialized)
+      ansible.builtin.command: kubeadm init --config=/root/kubeadm-config.yaml
+      when: not adminconf.stat.exists
+      register: kubeadm_init
+
+
+    # Show the kubeadm init output for debugging.
+    - name: Display kubeadm init output
+      ansible.builtin.debug:
+        var: kubeadm_init.stdout_lines
+      when: kubeadm_init is defined and kubeadm_init.stdout_lines is defined
+
+
+    # Generate a fresh join command for worker nodes.
+    # Safe to run even if cluster is already initialized - creates new token.
+    - name: Create/refresh worker join command script (safe to run even if already initialized)
+      ansible.builtin.shell: |
+        set -e
+        kubeadm token create --print-join-command > /root/kubeadm_join_cmd.sh
+        chmod 700 /root/kubeadm_join_cmd.sh
+
+
+    # Append the containerd CRI socket to the join command.
+    # Ensures workers use containerd instead of trying to auto-detect.
+    - name: Ensure join command uses containerd CRI socket
+      ansible.builtin.lineinfile:
+        path: /root/kubeadm_join_cmd.sh
+        backrefs: yes
+        regexp: '^(kubeadm join .*)$'
+        line: '\1 --cri-socket=unix:///run/containerd/containerd.sock'
+
+
+    # Show where the join command is stored.
+    - name: Show join command location
+      ansible.builtin.debug:
+        msg: "Worker join command saved to /root/kubeadm_join_cmd.sh on k8s-master"
+
+
+    # Wait for the API server to become responsive.
+    # Retries up to 10 times with 5 second delays.
+    - name: Wait for API server to be ready (uses admin.conf directly)
+      ansible.builtin.command: kubectl get nodes --kubeconfig=/etc/kubernetes/admin.conf
+      register: nodes_out
+      retries: 10
+      delay: 5
+      until: nodes_out.rc == 0
+      changed_when: false
+
+
+    # Display current node status.
+    - name: Print current node status
+      ansible.builtin.debug:
+        var: nodes_out.stdout_lines
+
+
+    # Verify the master node is using the correct InternalIP.
+    - name: Verify master node InternalIP matches api_server_ip
+      ansible.builtin.shell: |
+        kubectl get nodes -o wide --kubeconfig=/etc/kubernetes/admin.conf | awk 'NR==1 || /k8s-master/'
+      register: master_node_info
+      changed_when: false
+
+
+    # Show master node details.
+    - name: Display master node info
+      ansible.builtin.debug:
+        var: master_node_info.stdout_lines
