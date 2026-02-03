@@ -1,0 +1,184 @@
+---
+# Install Kubernetes tools (ALL nodes)
+# Installs kubeadm, kubelet, and kubectl from the official pkgs.k8s.io APT repo.
+#
+# - kubeadm: Bootstraps the Kubernetes cluster (init on control plane, join on workers)
+# - kubelet: Node agent that manages pods and containers on each node
+# - kubectl: Command-line tool for interacting with the Kubernetes API
+#
+# This playbook:
+# 1. Sets up secure repository access (GPG key + signed APT repo)
+# 2. Installs the three core Kubernetes tools
+# 3. Pins package versions to prevent unintended upgrades
+# 4. Verifies successful installation
+
+- name: Install Kubernetes tools on all nodes
+  hosts: k8s_cluster
+
+  # Run all tasks with elevated privileges (root),
+  # which is required for package management and system configuration.
+  become: yes
+
+  # Collect system facts (OS, kernel, network interfaces, etc.).
+  # These facts can be used later for conditionals or debugging.
+  gather_facts: yes
+
+  tasks:
+
+    # Base prerequisites for secure repository setup
+    # - ca-certificates: Trusted root CAs for TLS/HTTPS validation
+    # - curl: Used to securely download the repository signing key
+    # - gnupg: Used to verify and convert repository signing keys
+    #
+    # These packages enable secure, cryptographically verified downloads
+    # from the Kubernetes package repository.
+    - name: Install APT HTTPS and GPG prerequisites
+      ansible.builtin.apt:
+        name:
+          - ca-certificates   # TLS trust store
+          - curl              # fetch Release.key over HTTPS
+          - gnupg             # convert key to .gpg keyring (dearmor)
+        update_cache: yes
+        state: present
+
+
+    # Add Kubernetes repository signing key (stored in /etc/apt/keyrings)
+    # Modern APT best practice stores keys in /etc/apt/keyrings instead of
+    # the deprecated /etc/apt/trusted.gpg.d directory.
+    - name: Ensure APT keyrings directory exists
+      ansible.builtin.file:
+        path: "/etc/apt/keyrings"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+
+    # Download the Kubernetes repository signing key
+    # The Release.key is provided in ASCII-armored format and must
+    # be converted to binary (.gpg) format for APT to use it.
+    #
+    # This key is used to verify the authenticity of all packages
+    # downloaded from the Kubernetes repository.
+    - name: Download Kubernetes repository Release key (ASCII)
+      ansible.builtin.get_url:
+        url: "https://pkgs.k8s.io/core:/stable:/v1.35/deb/Release.key"
+        dest: "/tmp/kubernetes-release.key"
+        mode: "0644"
+
+
+    # Convert ASCII-armored key to binary APT keyring format
+    # APT requires keys in binary (.gpg) format, not ASCII-armored.
+    # The 'gpg --dearmor' command performs this conversion.
+    #
+    # The 'creates' parameter makes this task idempotent - it only
+    # runs if the output file doesn't already exist.
+    - name: Convert Release key to APT keyring (dearmor)
+      ansible.builtin.command:
+        cmd: "gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg /tmp/kubernetes-release.key"
+      args:
+        creates: "/etc/apt/keyrings/kubernetes-apt-keyring.gpg"
+
+
+    # Set appropriate permissions on the keyring
+    # Mode 0644 allows unprivileged APT processes (_apt user) to read
+    # the keyring when verifying package signatures.
+    - name: Set permissions on Kubernetes APT keyring
+      ansible.builtin.file:
+        path: "/etc/apt/keyrings/kubernetes-apt-keyring.gpg"
+        owner: root
+        group: root
+        mode: "0644"
+
+
+    # Add the Kubernetes APT repository
+    # The 'signed-by' parameter ties this repository exclusively to the
+    # keyring we just created, preventing APT from using other keys to
+    # validate packages from this repository.
+    #
+    # This follows the principle of least privilege and prevents
+    # package substitution attacks.
+    - name: Add Kubernetes APT repository list file
+      ansible.builtin.copy:
+        dest: "/etc/apt/sources.list.d/kubernetes.list"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.35/deb/ /
+
+
+    # Refresh APT package cache
+    # After adding a new repository, APT needs to download and cache
+    # the package metadata (Package files, Release files) before
+    # packages can be installed.
+    - name: Update APT cache after adding Kubernetes repo
+      ansible.builtin.apt:
+        update_cache: yes
+
+
+    # Install the three core Kubernetes tools
+    # - kubelet: Must be installed on ALL nodes (control plane + workers)
+    # - kubeadm: Must be installed on ALL nodes (used for init and join)
+    # - kubectl: Technically only required on nodes where you'll run commands,
+    # but typically installed everywhere for convenience
+    - name: Install kubelet, kubeadm, and kubectl
+      ansible.builtin.apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+
+
+    # Pin package versions to prevent automatic upgrades
+    # Kubernetes clusters require careful, coordinated upgrades.
+    # Automatic package upgrades can cause version skew between
+    # cluster components, leading to cluster instability or failure.
+    #
+    # The 'hold' selection prevents apt-get upgrade from touching
+    # these packages until they are explicitly unfrozen.
+    - name: Hold Kubernetes packages to prevent unintended upgrades
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+
+    # Verify installation (prints versions per node)
+    # These tasks confirm that all three tools installed correctly
+    # and are available in the system PATH.
+    #
+    # changed_when: false tells Ansible these commands don't modify
+    # system state, so they won't show as "changed" in the output.
+    - name: Verify kubeadm version
+      ansible.builtin.command: kubeadm version
+      register: kubeadm_ver
+      changed_when: false
+
+
+    - name: Verify kubectl client version
+      ansible.builtin.command: kubectl version --client=true
+      register: kubectl_ver
+      changed_when: false
+
+
+    - name: Verify kubelet version
+      ansible.builtin.command: kubelet --version
+      register: kubelet_ver
+      changed_when: false
+
+
+    # Display installed versions
+    # Shows the installed version of each tool on each node.
+    # This is useful for confirming version consistency across
+    # the cluster and for troubleshooting version skew issues.
+    - name: Show installed Kubernetes tool versions
+      ansible.builtin.debug:
+        msg:
+          - "{{ inventory_hostname }} kubeadm:  {{ kubeadm_ver.stdout }}"
+          - "{{ inventory_hostname }} kubectl:  {{ kubectl_ver.stdout }}"
+          - "{{ inventory_hostname }} kubelet:  {{ kubelet_ver.stdout }}"
