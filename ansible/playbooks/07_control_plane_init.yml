@@ -52,6 +52,8 @@
         content: |
           apiVersion: kubeadm.k8s.io/v1beta4
           kind: InitConfiguration
+          skipPhases:
+            - addon/kube-proxy
           localAPIEndpoint:
             advertiseAddress: "{{ api_server_ip }}"
             bindPort: 6443

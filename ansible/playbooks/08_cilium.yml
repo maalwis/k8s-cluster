@@ -126,6 +126,7 @@
         --set ipam.mode=cluster-pool
         --set ipam.operator.clusterPoolIPv4PodCIDRList=10.244.0.0/16
         --set ipam.operator.clusterPoolIPv4MaskSize=24
+        --set kubeProxyReplacement=true
       register: cilium_install
       changed_when: true
 
