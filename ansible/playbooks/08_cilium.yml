@@ -127,6 +127,8 @@
         --set ipam.operator.clusterPoolIPv4PodCIDRList=10.244.0.0/16
         --set ipam.operator.clusterPoolIPv4MaskSize=24
         --set kubeProxyReplacement=true
+        --set hubble.relay.enabled=true
+        --set hubble.ui.enabled=true
       register: cilium_install
       changed_when: true
 
